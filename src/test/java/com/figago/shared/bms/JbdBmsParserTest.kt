@@ -7,6 +7,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 class JbdBmsParserTest {
 
@@ -28,9 +29,9 @@ class JbdBmsParserTest {
         0x02,                   // FET: bit 1 set (discharge ON, charge OFF)
         0x04,                   // Cells: 4S
         0x03,                   // NTC count: 3
-        0x0B, 0xA0.toByte(),     // NTC 1: 0x0BA0 = 2976 (24.5 °C -> 25 °C)
-        0x0B, 0x9D.toByte(),     // NTC 2: 0x0B9D = 2973 (24.2 °C -> 24 °C)
-        0x0B, 0x98.toByte(),     // NTC 3: 0x0B98 = 2968 (23.7 °C -> 24 °C)
+        0x0B, 0xA0.toByte(),     // NTC 1: 0x0BA0 = 2976 (24.5 degC -> 25 degC)
+        0x0B, 0x9D.toByte(),     // NTC 2: 0x0B9D = 2973 (24.2 degC -> 24 degC)
+        0x0B, 0x98.toByte(),     // NTC 3: 0x0B98 = 2968 (23.7 degC -> 24 degC)
         0xFA.toByte(), 0x55,     // Checksum: 0xFA55
         0x77                    // Stop Byte
     )
@@ -46,6 +47,11 @@ class JbdBmsParserTest {
         0xFF.toByte(), 0x4E,     // Checksum: 0xFF4E
         0x77                    // Stop Byte
     )
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        return ByteArray(clean.size) { i -> clean[i].toInt(16).toByte() }
+    }
 
     @Test
     fun testParseBasicInfoCommand03() {
@@ -165,7 +171,7 @@ class JbdBmsParserTest {
         val parser = JbdBmsParser()
 
         // Construct 0x03 frame with negative current (-15.50 A -> raw -1550 = 0xF9F2)
-        // and negative temperature (-10.5 °C -> raw 2626 = 0x0A42)
+        // and negative temperature (-10.5 degC -> raw 2626 = 0x0A42)
         val frameWithoutCrc = byteArrayOf(
             0xDD.toByte(), 0x03, 0x00, 0x19, // Length 25 (23 + 2 bytes for 1 NTC)
             0x05, 0xDC.toByte(),             // Voltage: 1500 -> 15.00 V
@@ -182,7 +188,7 @@ class JbdBmsParserTest {
             0x03,                           // FET: both charge and discharge ON
             0x04,                           // Cells: 4
             0x01,                           // NTC count: 1
-            0x0A, 0x42                      // NTC 1: 2626 -> -10.5 °C
+            0x0A, 0x42                      // NTC 1: 2626 -> -10.5 degC
         )
 
         // Checksum covers status(byte 2) + length(byte 3) + data(bytes 4..28)
@@ -266,10 +272,12 @@ class JbdBmsParserTest {
         val parser = JbdBmsParser()
         parser.assemble(vector1BasicInfo)
         assertEquals(0x1000, parser.lastProtectionState)
+        assertNotNull(parser.lastCommandResponse)
 
         parser.reset()
         assertNull(parser.lastProtectionState)
         assertNull(parser.lastCycleCount)
+        assertNull(parser.lastCommandResponse)
 
         // After reset, feeding 0x04 should not contain previous 0x03 basic info
         val status04 = parser.assemble(vector2CellVoltages)
@@ -306,9 +314,9 @@ class JbdBmsParserTest {
 
         // Test -1.54 A (0xFF 0x66) and negative temperatures (< 273.1 K):
         // 0xFF66 signed 16-bit = -154 -> -1.54 A
-        // NTC 1: 2681 -> -5.0 °C
-        // NTC 2: 2531 -> -20.0 °C
-        // NTC 3: 2730 -> -0.1 °C (rounded 0 °C)
+        // NTC 1: 2681 -> -5.0 degC
+        // NTC 2: 2531 -> -20.0 degC
+        // NTC 3: 2730 -> -0.1 degC (rounded 0 degC)
         val frameWithoutCrc = byteArrayOf(
             0xDD.toByte(), 0x03, 0x00, 0x1D, // Length 29 (23 base + 6 bytes for 3 NTCs)
             0x05, 0xDC.toByte(),             // Voltage: 1500 -> 15.00 V
@@ -325,9 +333,9 @@ class JbdBmsParserTest {
             0x02,                           // FET: discharge ON, charge OFF
             0x04,                           // Cells: 4
             0x03,                           // NTC count: 3
-            0x0A, 0x79.toByte(),             // NTC 1: 2681 -> -5.0 °C
-            0x09, 0xE3.toByte(),             // NTC 2: 2531 -> -20.0 °C
-            0x0A, 0xAA.toByte()              // NTC 3: 2730 -> -0.1 °C
+            0x0A, 0x79.toByte(),             // NTC 1: 2681 -> -5.0 degC
+            0x09, 0xE3.toByte(),             // NTC 2: 2531 -> -20.0 degC
+            0x0A, 0xAA.toByte()              // NTC 3: 2730 -> -0.1 degC
         )
 
         val crcPayload = frameWithoutCrc.copyOfRange(2, frameWithoutCrc.size)
@@ -402,6 +410,143 @@ class JbdBmsParserTest {
 
         val status = parser.parse(errorFrame)
         assertNull("Error response (status 0x80) should not produce AntBmsStatus", status)
+        assertNotNull("Valid CRC error frame must still be captured in lastCommandResponse", parser.lastCommandResponse)
+        assertEquals(JbdBmsParser.CMD_BASIC_INFO, parser.lastCommandResponse?.register)
+        assertEquals(0x80.toByte(), parser.lastCommandResponse?.status)
+        assertFalse(parser.lastCommandResponse?.isOk ?: true)
+    }
+
+    @Test
+    fun testNonZeroStatus0x01RejectedAsError() {
+        val parser = JbdBmsParser()
+
+        // BMS sends non-zero status = 0x01 on register 0x07 (CRC = 0x10000 - 0x0001 = 0xFFFF)
+        val status01Frame = byteArrayOf(
+            0xDD.toByte(), 0x07, 0x01, 0x00,
+            0xFF.toByte(), 0xFF.toByte(),
+            0x77
+        )
+        assertFalse(
+            "Any non-zero status (e.g. 0x01) must be rejected by isCommandResponseOk",
+            JbdBmsParser.isCommandResponseOk(status01Frame, JbdBmsParser.REG_SET_PASSWORD)
+        )
+
+        val status = parser.assemble(status01Frame)
+        assertNull(status)
+        assertNotNull(parser.lastCommandResponse)
+        assertEquals(JbdBmsParser.REG_SET_PASSWORD, parser.lastCommandResponse?.register)
+        assertEquals(0x01.toByte(), parser.lastCommandResponse?.status)
+        assertFalse(parser.lastCommandResponse?.isOk ?: true)
+    }
+
+    @Test
+    fun testOddLengthCellVoltages0x04Rejected() {
+        val parser = JbdBmsParser()
+
+        // Construct 0x04 frame with odd length (3 bytes = 1.5 cells, invalid)
+        val oddCellFramePrefix = byteArrayOf(
+            0xDD.toByte(), 0x04, 0x00, 0x03,
+            0x0F, 0x23, 0x0F
+        )
+        val crc = JbdBmsParser.calculateChecksum(oddCellFramePrefix.copyOfRange(2, oddCellFramePrefix.size))
+        val oddCellFrame = oddCellFramePrefix + crc + byteArrayOf(0x77)
+
+        assertFalse(
+            "Odd byte count in 0x04 must be rejected by isCommandResponseOk",
+            JbdBmsParser.isCommandResponseOk(oddCellFrame, JbdBmsParser.CMD_CELL_VOLTAGES)
+        )
+        assertNull("Odd byte count in 0x04 must be rejected by assemble", parser.assemble(oddCellFrame))
+    }
+
+    @Test
+    fun testTrailingBytesRejectedInIsCommandResponseOk() {
+        val okAck = byteArrayOf(
+            0xDD.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x77
+        )
+        assertTrue(JbdBmsParser.isCommandResponseOk(okAck, JbdBmsParser.REG_ENTER_FACTORY))
+
+        val withTrailing = okAck + byteArrayOf(0x00)
+        assertFalse(
+            "Frame with extra trailing bytes must be rejected by isCommandResponseOk",
+            JbdBmsParser.isCommandResponseOk(withTrailing, JbdBmsParser.REG_ENTER_FACTORY)
+        )
+    }
+
+    @Test
+    fun testStreamingCommandAckAndGluedTelemetryInAssemble() {
+        val parser = JbdBmsParser()
+        val capturedResponses = mutableListOf<JbdBmsParser.CommandResponse>()
+        parser.onCommandResponse = { capturedResponses.add(it) }
+
+        val ackEnterFactory = hexToBytes("DD 00 00 00 00 00 77")
+        val ackAuthPassword = hexToBytes("DD 06 00 00 00 00 77")
+        val ackSetPassword = hexToBytes("DD 07 00 00 00 00 77")
+        val ackClearPassword = hexToBytes("DD 09 00 00 00 00 77")
+        val ackExitFactory = hexToBytes("DD 01 00 00 00 00 77")
+
+        assertNull(parser.assemble(ackEnterFactory))
+        assertEquals(JbdBmsParser.REG_ENTER_FACTORY, parser.lastCommandResponse?.register)
+        assertTrue(parser.lastCommandResponse?.isOk == true)
+
+        // Feed glued ACK (0x07) + Basic Info (0x03) in a single BLE chunk
+        val gluedAckAnd03 = ackAuthPassword + ackSetPassword + ackClearPassword + ackExitFactory + vector1BasicInfo
+        val status = parser.assemble(gluedAckAnd03)
+        assertNotNull("Telemetry in glued ACK+0x03 stream must be returned", status)
+        assertEquals(15.47, status?.voltage ?: 0.0, 0.001)
+        assertEquals(6, capturedResponses.size)
+        assertEquals(JbdBmsParser.REG_ENTER_FACTORY, capturedResponses[0].register)
+        assertEquals(JbdBmsParser.REG_USE_PASSWORD, capturedResponses[1].register)
+        assertEquals(JbdBmsParser.REG_SET_PASSWORD, capturedResponses[2].register)
+        assertEquals(JbdBmsParser.REG_CLEAR_PASSWORD, capturedResponses[3].register)
+        assertEquals(JbdBmsParser.REG_EXIT_FACTORY, capturedResponses[4].register)
+        assertEquals(JbdBmsParser.CMD_BASIC_INFO, capturedResponses[5].register)
+    }
+
+    @Test
+    fun testReferenceSampleDumpVectorsAre100PercentValid() {
+        // Verify every single TX and RX frame from hardware-dumps/jbd_xiaoxiang_4s_sample.txt (C-01)
+        val authTx = hexToBytes("DD 5A 00 02 56 78 FF 30 77")
+        val authRx = hexToBytes("DD 00 00 00 00 00 77")
+        assertArrayEquals(authTx, JbdBmsParser.createEnterFactoryModeRequest())
+        assertTrue(JbdBmsParser.isCommandResponseOk(authRx, JbdBmsParser.REG_ENTER_FACTORY))
+
+        val basicTx = hexToBytes("DD A5 03 00 FF FD 77")
+        val basicRx = hexToBytes("DD 03 00 1D 06 0B 00 00 01 ED 01 F4 00 00 2C 7C 00 00 00 00 10 00 80 63 02 04 03 0B A0 0B 9D 0B 98 FA 55 77")
+        assertArrayEquals(basicTx, JbdBmsParser.createBasicInfoRequest())
+        assertTrue(JbdBmsParser.isCommandResponseOk(basicRx, JbdBmsParser.CMD_BASIC_INFO))
+
+        val cellTx = hexToBytes("DD A5 04 00 FF FC 77")
+        val cellRx = hexToBytes("DD 04 00 08 0F 23 0F 1C 0F 12 0F 1D FF 4E 77")
+        assertArrayEquals(cellTx, JbdBmsParser.createCellVoltagesRequest())
+        assertTrue(JbdBmsParser.isCommandResponseOk(cellRx, JbdBmsParser.CMD_CELL_VOLTAGES))
+
+        val devNameTx = hexToBytes("DD A5 05 00 FF FB 77")
+        val devNameRx = hexToBytes("DD 05 00 0E 4A 42 44 2D 53 50 30 34 53 30 33 34 2D 4C FC 86 77")
+        assertArrayEquals(devNameTx, JbdBmsParser.createDeviceNameRequest())
+        assertTrue(JbdBmsParser.isCommandResponseOk(devNameRx, JbdBmsParser.CMD_DEVICE_NAME))
+
+        val exitTx = hexToBytes("DD 5A 01 02 28 28 FF AD 77")
+        val exitRx = hexToBytes("DD 01 00 00 00 00 77")
+        assertArrayEquals(exitTx, JbdBmsParser.createExitFactoryModeRequest())
+        assertTrue(JbdBmsParser.isCommandResponseOk(exitRx, JbdBmsParser.REG_EXIT_FACTORY))
+
+        // Replay entire RX sequence through streaming parser
+        val parser = JbdBmsParser()
+        val rxFrames = mutableListOf<JbdBmsParser.CommandResponse>()
+        parser.onCommandResponse = { rxFrames.add(it) }
+
+        parser.assemble(authRx)
+        parser.assemble(basicRx)
+        parser.assemble(cellRx)
+        val finalStatus = parser.assemble(devNameRx)
+        parser.assemble(exitRx)
+
+        assertEquals(5, rxFrames.size)
+        assertTrue(rxFrames.all { it.isOk })
+        assertEquals("JBD-SP04S034-L", parser.lastDeviceName)
+        assertNotNull(finalStatus)
+        assertEquals(15.47, finalStatus?.voltage ?: 0.0, 0.001)
+        assertEquals(4, finalStatus?.cellVoltages?.size)
     }
 
     @Test
@@ -560,7 +705,7 @@ class JbdBmsParserTest {
 
     @Test(expected = IllegalArgumentException::class)
     fun testSetPasswordRejectsNonAsciiCharacters() {
-        JbdBmsParser.createSetPasswordRequest("12345Б")
+        JbdBmsParser.createSetPasswordRequest("12345\u0080")
     }
 
     @Test
@@ -609,5 +754,182 @@ class JbdBmsParserTest {
 
         parser.reset()
         assertFalse(parser.isDeviceNameResolved)
+    }
+
+    @Test
+    fun testJkBmsParserRejects300BytesOfNoiseAndValidatesCrc() {
+        val jkParser = JkBmsParser()
+
+        // 1. Feed 350 bytes of arbitrary noise (and even fake 0x4E 0x57 header with garbage)
+        val noise = ByteArray(350) { i -> (i * 37 + 13).toByte() }
+        noise[0] = 0x4E
+        noise[1] = 0x57
+        assertNull("JkBmsParser must NEVER return fake 50% SoC on 300+ bytes of noise", jkParser.assemble(noise))
+
+        // 2. Construct a valid CRC-verified JK telemetry response frame
+        // Payload tags:
+        // 0x79 (cells, len 6 = 2 cells): [0x01, 0x0C, 0xE4 (3300mV), 0x02, 0x0C, 0xEE (3310mV)]
+        // 0x80 (MOS temp): [0x00, 0x19 (25 degC)]
+        // 0x83 (total voltage): [0x02, 0x96 (662 -> 6.62V)]
+        // 0x84 (current): [0x00, 0x64 (100 -> 1.00A)]
+        // 0x85 (SoC): [0x55 (85%)]
+        val tlvPayload = byteArrayOf(
+            0x79, 0x06, 0x01, 0x0C, 0xE4.toByte(), 0x02, 0x0C, 0xEE.toByte(),
+            0x80.toByte(), 0x00, 0x19,
+            0x83.toByte(), 0x02, 0x96.toByte(),
+            0x84.toByte(), 0x00, 0x64,
+            0x85.toByte(), 0x55
+        )
+        // Header (11 bytes) + TLV payload (19 bytes) + Tail (9 bytes: 0x68 + 6 bytes record/pad + 2 bytes CRC) = 39 bytes
+        val frameLen = 11 + tlvPayload.size + 9
+        val frame = ByteArray(frameLen)
+        frame[0] = 0x4E
+        frame[1] = 0x57
+        frame[2] = ((frameLen shr 8) and 0xFF).toByte()
+        frame[3] = (frameLen and 0xFF).toByte()
+        frame[8] = 0x06 // Command: read all
+        frame[9] = 0x02 // Frame type: BMS response
+        System.arraycopy(tlvPayload, 0, frame, 11, tlvPayload.size)
+        frame[frameLen - 9] = 0x68 // End-of-record marker
+        val crc = JkBmsParser.calculateChecksum16(frame, frameLen - 2)
+        frame[frameLen - 2] = ((crc shr 8) and 0xFF).toByte()
+        frame[frameLen - 1] = (crc and 0xFF).toByte()
+
+        // Corrupt CRC first -> must return null
+        val badCrcFrame = frame.clone()
+        badCrcFrame[frameLen - 1] = (badCrcFrame[frameLen - 1] + 1).toByte()
+        assertNull("JkBmsParser must reject frame with invalid 16-bit checksum", jkParser.assemble(badCrcFrame))
+
+        // Valid frame -> must decode accurately
+        val status = jkParser.assemble(frame)
+        assertNotNull("JkBmsParser must decode valid CRC-verified telemetry frame", status)
+        assertEquals(85, status?.soc)
+        assertEquals(6.62, status?.voltage ?: 0.0, 0.001)
+        assertEquals(1.00, status?.current ?: 0.0, 0.001)
+        assertEquals(2, status?.cellVoltages?.size)
+        assertEquals(3.300, status?.cellVoltages?.get(0) ?: 0.0, 0.001)
+        assertEquals(3.310, status?.cellVoltages?.get(1) ?: 0.0, 0.001)
+        assertEquals(25, status?.temperature)
+    }
+
+    @Test
+    fun testDalyBmsParserValidatesChecksumAndResyncsNoise() {
+        val dalyParser = DalyBmsParser()
+
+        // Valid 0x90 response:
+        // Voltage: 26.8V -> 268 (0x010C)
+        // Current: +15.0A -> 30000 + 150 = 30150 (0x75C6)
+        // SoC: 82.0% -> 820 (0x0334)
+        val validFrame = ByteArray(13)
+        validFrame[0] = 0xA5.toByte()
+        validFrame[1] = 0x01 // BMS address
+        validFrame[2] = 0x90.toByte()
+        validFrame[3] = 0x08
+        validFrame[4] = 0x01
+        validFrame[5] = 0x0C
+        validFrame[6] = 0x00
+        validFrame[7] = 0x00
+        validFrame[8] = 0x75
+        validFrame[9] = 0xC6.toByte()
+        validFrame[10] = 0x03
+        validFrame[11] = 0x34
+        validFrame[12] = DalyBmsParser.calculateChecksum(validFrame)
+
+        // 1. Corrupt checksum -> must be rejected
+        val corruptedFrame = validFrame.clone()
+        corruptedFrame[12] = (corruptedFrame[12] + 1).toByte()
+        assertNull("DalyBmsParser must reject 0x90 frame with invalid checksum", dalyParser.assemble(corruptedFrame))
+
+        // 2. Leading noise + corrupted false start + valid frame -> must resync and parse valid frame
+        val stream = byteArrayOf(0x00, 0xFF.toByte(), 0xA5.toByte(), 0x01, 0x90.toByte()) + validFrame
+        val status = dalyParser.assemble(stream)
+        assertNotNull("DalyBmsParser must resync after noise and decode valid frame", status)
+        assertEquals(82, status?.soc)
+        assertEquals(26.8, status?.voltage ?: 0.0, 0.001)
+        assertEquals(15.0, status?.current ?: 0.0, 0.001)
+    }
+
+    @Test
+    fun testSampleDumpFileLineByLine() {
+        val dumpFile = File("hardware-dumps/jbd_xiaoxiang_4s_sample.txt")
+        assertTrue(
+            "Sample dump file must exist at ${dumpFile.absolutePath}",
+            dumpFile.exists() && dumpFile.isFile
+        )
+
+        val parser = JbdBmsParser()
+        val capturedResponses = mutableListOf<JbdBmsParser.CommandResponse>()
+        parser.onCommandResponse = { capturedResponses.add(it) }
+
+        var txCount = 0
+        var rxCount = 0
+        var latestStatus: AntBmsStatus? = null
+
+        dumpFile.readLines().forEachIndexed { index, rawLine ->
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("===")) {
+                return@forEachIndexed
+            }
+
+            val txMarkerIdx = line.indexOf("TX:")
+            val rxMarkerIdx = line.indexOf("RX:")
+
+            when {
+                txMarkerIdx != -1 -> {
+                    val hexPayload = line.substring(txMarkerIdx + 3).trim()
+                    val txBytes = hexToBytes(hexPayload)
+                    assertTrue("Line ${index + 1} TX frame too short", txBytes.size >= 7)
+                    assertEquals("Line ${index + 1} TX start byte must be 0xDD", JbdBmsParser.START_BYTE, txBytes[0])
+                    assertTrue(
+                        "Line ${index + 1} TX opcode must be 0xA5 or 0x5A",
+                        txBytes[1] == JbdBmsParser.OP_READ || txBytes[1] == JbdBmsParser.CMD_WRITE
+                    )
+                    val len = txBytes[3].toInt() and 0xFF
+                    assertEquals("Line ${index + 1} TX frame length mismatch", 4 + len + 3, txBytes.size)
+                    assertEquals("Line ${index + 1} TX stop byte must be 0x77", JbdBmsParser.STOP_BYTE, txBytes.last())
+
+                    val expectedCrc = JbdBmsParser.calculateChecksum(txBytes.copyOfRange(2, 4 + len))
+                    assertEquals("Line ${index + 1} TX CRC_H mismatch", expectedCrc[0], txBytes[4 + len])
+                    assertEquals("Line ${index + 1} TX CRC_L mismatch", expectedCrc[1], txBytes[5 + len])
+                    txCount++
+                }
+                rxMarkerIdx != -1 -> {
+                    val hexPayload = line.substring(rxMarkerIdx + 3).trim()
+                    val rxBytes = hexToBytes(hexPayload)
+                    assertTrue(
+                        "Line ${index + 1} RX frame failed isCommandResponseOk: $line",
+                        JbdBmsParser.isCommandResponseOk(rxBytes)
+                    )
+
+                    val beforeResponses = capturedResponses.size
+                    val status = parser.assemble(rxBytes)
+                    assertEquals(
+                        "Line ${index + 1} RX frame must emit one CommandResponse",
+                        beforeResponses + 1,
+                        capturedResponses.size
+                    )
+                    assertTrue(
+                        "Line ${index + 1} RX CommandResponse must be OK",
+                        capturedResponses.last().isOk
+                    )
+                    if (rxBytes[1] == JbdBmsParser.CMD_BASIC_INFO || rxBytes[1] == JbdBmsParser.CMD_CELL_VOLTAGES) {
+                        assertNotNull("Line ${index + 1} telemetry frame must return AntBmsStatus", status)
+                    }
+                    if (status != null) {
+                        latestStatus = status
+                    }
+                    rxCount++
+                }
+            }
+        }
+
+        assertEquals(5, txCount)
+        assertEquals(5, rxCount)
+        assertEquals(5, capturedResponses.size)
+        assertEquals("JBD-SP04S034-L", parser.lastDeviceName)
+        assertNotNull(latestStatus)
+        assertEquals(15.47, latestStatus?.voltage ?: 0.0, 0.001)
+        assertEquals(99, latestStatus?.soc)
+        assertEquals(4, latestStatus?.cellVoltages?.size)
     }
 }

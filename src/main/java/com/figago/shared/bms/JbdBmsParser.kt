@@ -7,10 +7,43 @@ package com.figago.shared.bms
  * - Request framing and two's complement checksum calculation
  * - Dynamic response parsing for Command 0x03 (Basic Information: V, I, SOC, capacity, FETs, temperatures, protection)
  * - Dynamic response parsing for Command 0x04 (Cell Voltages: individual cell mV, min/max cell)
+ * - Dynamic response parsing for Command 0x05 (Hardware Device Name / Model)
+ * - Unified streaming ACK/NACK frame decoding for write/command registers (0x00, 0x01, 0x06, 0x07, 0x09)
  * - State accumulation: merges 0x03 and 0x04 frames into a unified [AntBmsStatus] / [BmsData]
  * - Pre-allocated ring/shift buffer resilient to MTU 20-byte BLE fragmentation, noise/garbage bytes, and glued frames.
  */
 class JbdBmsParser {
+
+    /**
+     * Represents a validated JBD response frame (either telemetry or command ACK/NACK)
+     * extracted by the streaming [assemble] parser.
+     */
+    data class CommandResponse(
+        val register: Byte,
+        val status: Byte,
+        val payload: ByteArray,
+        val rawFrame: ByteArray
+    ) {
+        val isOk: Boolean
+            get() = status == STATUS_OK
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is CommandResponse) return false
+            return register == other.register &&
+                status == other.status &&
+                payload.contentEquals(other.payload) &&
+                rawFrame.contentEquals(other.rawFrame)
+        }
+
+        override fun hashCode(): Int {
+            var result = register.toInt()
+            result = 31 * result + status.toInt()
+            result = 31 * result + payload.contentHashCode()
+            result = 31 * result + rawFrame.contentHashCode()
+            return result
+        }
+    }
 
     private val buffer = ByteArray(1024)
     private var bufferSize = 0
@@ -38,6 +71,17 @@ class JbdBmsParser {
         private set
     var lastTemperaturesCelsius: List<Double> = emptyList()
         private set
+
+    /**
+     * Most recent validated frame (telemetry or command ACK/NACK) decoded by [assemble].
+     */
+    var lastCommandResponse: CommandResponse? = null
+        private set
+
+    /**
+     * Optional listener invoked synchronously whenever [assemble] extracts a valid, CRC-verified frame.
+     */
+    var onCommandResponse: ((CommandResponse) -> Unit)? = null
 
     companion object {
         const val START_BYTE: Byte = 0xDD.toByte()
@@ -72,6 +116,34 @@ class JbdBmsParser {
         const val PROT_SHORT_CIRCUIT: Int = 1 shl 10
         const val PROT_IC_ERROR: Int = 1 shl 11
         const val PROT_MOS_LOCK: Int = 1 shl 12
+
+        private fun isKnownRegister(register: Byte): Boolean {
+            return register == CMD_BASIC_INFO ||
+                register == CMD_CELL_VOLTAGES ||
+                register == CMD_DEVICE_NAME ||
+                register == REG_ENTER_FACTORY ||
+                register == REG_EXIT_FACTORY ||
+                register == REG_USE_PASSWORD ||
+                register == REG_SET_PASSWORD ||
+                register == REG_CLEAR_PASSWORD
+        }
+
+        private fun isValidPayloadLength(register: Byte, status: Byte, dataLen: Int): Boolean {
+            if (status != STATUS_OK) {
+                return dataLen in 0..16
+            }
+            return when (register) {
+                CMD_BASIC_INFO -> dataLen in 23..64
+                CMD_CELL_VOLTAGES -> dataLen in 2..64 && (dataLen % 2 == 0)
+                CMD_DEVICE_NAME -> dataLen in 0..64
+                REG_ENTER_FACTORY,
+                REG_EXIT_FACTORY,
+                REG_USE_PASSWORD,
+                REG_SET_PASSWORD,
+                REG_CLEAR_PASSWORD -> dataLen in 0..64
+                else -> false
+            }
+        }
 
         /**
          * Calculates the standard JBD 16-bit Big-Endian two's complement checksum:
@@ -167,6 +239,9 @@ class JbdBmsParser {
         /**
          * Creates Enter Factory Mode request (Register 0x00, payload 0x56 0x78):
          * DD 5A 00 02 56 78 FF 30 77
+         *
+         * WARNING: Factory/EEPROM mode commands are hardware-revision sensitive and must not be
+         * executed in production without physical hardware verification for the target BMS board.
          */
         fun createEnterFactoryModeRequest(): ByteArray =
             createWriteRequest(REG_ENTER_FACTORY, byteArrayOf(0x56, 0x78))
@@ -174,12 +249,20 @@ class JbdBmsParser {
         /**
          * Creates Exit Factory Mode request with EEPROM save (Register 0x01, payload 0x28 0x28):
          * DD 5A 01 02 28 28 FF AD 77
+         *
+         * WARNING: JBD firmware revisions differ on Register 0x01 semantics (some revisions use
+         * 0x28 0x28 to save EEPROM and 0x00 0x00 to exit without saving, while others invert or
+         * restrict these payloads). Do not enable EEPROM writes in production without verifying
+         * physical hardware traces for the target BMS revision.
          */
         fun createExitFactoryModeRequest(): ByteArray =
             createWriteRequest(REG_EXIT_FACTORY, byteArrayOf(0x28, 0x28))
 
         /**
          * Creates Password Authentication request (Register 0x06, 6 ASCII bytes).
+         *
+         * WARNING: Password register layout (0x06/0x07/0x09) varies across JBD firmware revisions.
+         * Keep disabled in production until verified on physical target hardware.
          */
         fun createAuthPasswordRequest(password: String): ByteArray {
             validatePassword(password)
@@ -188,6 +271,9 @@ class JbdBmsParser {
 
         /**
          * Creates Set Password request (Register 0x07, 6 ASCII bytes).
+         *
+         * WARNING: Password register layout (0x06/0x07/0x09) varies across JBD firmware revisions.
+         * Keep disabled in production until verified on physical target hardware.
          */
         fun createSetPasswordRequest(password: String): ByteArray {
             validatePassword(password)
@@ -197,6 +283,9 @@ class JbdBmsParser {
         /**
          * Creates Clear Password request (Register 0x09, payload 0x00 0x00):
          * DD 5A 09 02 00 00 FF F5 77
+         *
+         * WARNING: Password register layout (0x06/0x07/0x09) varies across JBD firmware revisions.
+         * Keep disabled in production until verified on physical target hardware.
          */
         fun createClearPasswordRequest(): ByteArray =
             createWriteRequest(REG_CLEAR_PASSWORD, byteArrayOf(0x00, 0x00))
@@ -208,12 +297,18 @@ class JbdBmsParser {
         }
 
         /**
-         * Validates a JBD command response frame:
+         * Validates a single standalone JBD command/telemetry response frame:
          * [0xDD] [Register] [Status] [Length N] [Data: N bytes] [CRC_H] [CRC_L] [0x77]
+         *
+         * Strictly requires:
+         * - Exact frame byte length (no trailing bytes)
+         * - Status == STATUS_OK (0x00); any non-zero status returns false
+         * - Valid register-specific payload length (including even byte count for 0x04 cell voltages)
+         * - Matching 16-bit Big-Endian two's complement checksum and 0x77 stop byte
          *
          * @param data Raw response frame bytes
          * @param expectedRegister Optional register to match against byte[1]
-         * @return true if framing, CRC, register (if specified), and status (STATUS_OK = 0x00) are all valid
+         * @return true if framing, CRC, payload length, register (if specified), and status (STATUS_OK = 0x00) are all valid
          */
         fun isCommandResponseOk(data: ByteArray, expectedRegister: Byte? = null): Boolean {
             if (data.size < 7) return false
@@ -223,18 +318,35 @@ class JbdBmsParser {
             if (expectedRegister != null && register != expectedRegister) return false
 
             val status = data[2]
+            if (status != STATUS_OK) return false
+
             val dataLen = data[3].toInt() and 0xFF
             val expectedFrameLen = 4 + dataLen + 3
             if (data.size != expectedFrameLen) return false
             if (data[expectedFrameLen - 1] != STOP_BYTE) return false
 
-            val crcInput = data.copyOfRange(2, 4 + dataLen)
-            val expectedCrc = calculateChecksum(crcInput)
-            if (data[4 + dataLen] != expectedCrc[0] || data[5 + dataLen] != expectedCrc[1]) {
+            if (register == CMD_CELL_VOLTAGES && (dataLen < 2 || dataLen > 64 || dataLen % 2 != 0)) {
+                return false
+            }
+            if (register == CMD_BASIC_INFO && (dataLen < 23 || dataLen > 64)) {
+                return false
+            }
+            if (dataLen > 64) {
                 return false
             }
 
-            return status == STATUS_OK
+            val crcInput = data.copyOfRange(2, 4 + dataLen)
+            val expectedCrc = calculateChecksum(crcInput)
+            val crcWithCmd = calculateChecksum(data.copyOfRange(1, 4 + dataLen))
+            val matchesStandard = data[4 + dataLen] == expectedCrc[0] && data[5 + dataLen] == expectedCrc[1]
+            val matchesWithCmd = register == CMD_DEVICE_NAME &&
+                data[4 + dataLen] == crcWithCmd[0] &&
+                data[5 + dataLen] == crcWithCmd[1]
+            if (!matchesStandard && !matchesWithCmd) {
+                return false
+            }
+
+            return true
         }
     }
 
@@ -257,6 +369,7 @@ class JbdBmsParser {
         lastDeviceName = null
         isDeviceNameResolved = false
         lastTemperaturesCelsius = emptyList()
+        lastCommandResponse = null
     }
 
     /**
@@ -265,11 +378,12 @@ class JbdBmsParser {
     fun parse(data: ByteArray): AntBmsStatus? = assemble(data)
 
     /**
-     * Appends incoming BLE chunk to internal buffer and parses all complete, valid JBD frames.
+     * Appends incoming BLE chunk to internal buffer and parses all complete, valid JBD frames
+     * (both telemetry responses 0x03/0x04/0x05 and command ACK/NACK responses 0x00/0x01/0x06/0x07/0x09).
      * Handles MTU fragmentation (e.g. 20-byte chunks), glued frames, and corrupt data.
      *
      * @param data Incoming raw bytes from BLE characteristic notification
-     * @return Updated [AntBmsStatus] if at least one valid frame was processed, or null if awaiting more data.
+     * @return Updated [AntBmsStatus] if at least one valid telemetry frame was processed, or null if awaiting more data.
      */
     @Synchronized
     fun assemble(data: ByteArray): AntBmsStatus? {
@@ -286,7 +400,7 @@ class JbdBmsParser {
         var latestStatus: AntBmsStatus? = null
 
         // JBD response frame structure:
-        // [0xDD] [Cmd] [Status] [Len N] [Data: N bytes] [CRC_H] [CRC_L] [0x77]
+        // [0xDD] [Cmd/Reg] [Status] [Len N] [Data: N bytes] [CRC_H] [CRC_L] [0x77]
         // Minimum frame size with N=0 is 7 bytes.
         while (bufferSize >= 7) {
             // 1. Scan for start marker 0xDD
@@ -319,35 +433,14 @@ class JbdBmsParser {
             val status = buffer[2]
             val dataLen = buffer[3].toInt() and 0xFF
 
-            // Quick validation of response status and known command codes
-            if (status != STATUS_OK && status != 0x80.toByte()) {
+            if (!isKnownRegister(command)) {
                 advanceBuffer(1)
                 continue
             }
 
-            if (command != CMD_BASIC_INFO && command != CMD_CELL_VOLTAGES && command != CMD_DEVICE_NAME) {
+            if (!isValidPayloadLength(command, status, dataLen)) {
                 advanceBuffer(1)
                 continue
-            }
-
-            // Command-specific payload length sanity check
-            if (status == STATUS_OK) {
-                val isLenValid = when (command) {
-                    CMD_BASIC_INFO -> dataLen in 23..64
-                    CMD_CELL_VOLTAGES -> dataLen in 2..64 && (dataLen % 2 == 0)
-                    CMD_DEVICE_NAME -> dataLen in 0..64
-                    else -> dataLen in 0..128
-                }
-                if (!isLenValid) {
-                    advanceBuffer(1)
-                    continue
-                }
-            } else {
-                // For error status (0x80), payload length is typically 0
-                if (dataLen > 16) {
-                    advanceBuffer(1)
-                    continue
-                }
             }
 
             val frameLen = 4 + dataLen + 3 // Header(4) + Data(N) + CRC(2) + Stop(1)
@@ -370,16 +463,29 @@ class JbdBmsParser {
                 sum += buffer[i].toInt() and 0xFF
             }
             val expectedCrc = (0x10000 - (sum and 0xFFFF)) and 0xFFFF
+            val expectedCrcWithCmd = (0x10000 - ((sum + (command.toInt() and 0xFF)) and 0xFFFF)) and 0xFFFF
             val actualCrc = ((buffer[4 + dataLen].toInt() and 0xFF) shl 8) or
                             (buffer[5 + dataLen].toInt() and 0xFF)
 
-            if (expectedCrc != actualCrc) {
+            val isCrcValid = actualCrc == expectedCrc ||
+                (command == CMD_DEVICE_NAME && actualCrc == expectedCrcWithCmd)
+            if (!isCrcValid) {
                 // Checksum failed: corrupted packet or false start byte
                 advanceBuffer(1)
                 continue
             }
 
-            // Frame is valid! Process based on command if status is OK (0x00)
+            // Record validated command/telemetry frame and notify listener
+            val response = CommandResponse(
+                register = command,
+                status = status,
+                payload = buffer.copyOfRange(4, 4 + dataLen),
+                rawFrame = buffer.copyOfRange(0, frameLen)
+            )
+            lastCommandResponse = response
+            onCommandResponse?.invoke(response)
+
+            // Process telemetry state only when status is strictly STATUS_OK (0x00)
             if (status == STATUS_OK) {
                 val statusResult = processValidFrame(command, 4, dataLen)
                 if (statusResult != null) {
@@ -417,7 +523,7 @@ class JbdBmsParser {
                 isDeviceNameResolved = true
                 cachedBasicStatus
             }
-            else -> cachedBasicStatus
+            else -> null
         }
     }
 
@@ -480,7 +586,7 @@ class JbdBmsParser {
         val ntcCount = buffer[offset + 22].toInt() and 0xFF
 
         // 14. NTC Temperatures: uint16 Big-Endian in 0.1 Kelvin
-        // Formula: T(°C) = (raw - 2731) / 10.0
+        // Formula: T(degC) = (raw - 2731) / 10.0
         val availableNtc = minOf(ntcCount, (dataLen - 23) / 2)
         val tempsIntList = ArrayList<Int>(availableNtc)
         val tempsDoubleList = ArrayList<Double>(availableNtc)
